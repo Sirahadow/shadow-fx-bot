@@ -2,17 +2,15 @@ name: Shadow FX Bot
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
+  schedule:
+    - cron: "*/5 * * * *"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
 
     steps:
-      - name: Get repository files
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -20,9 +18,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install libraries
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run Shadow FX Bot
