@@ -4,19 +4,20 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timezone
 
-# =================================
+# ==========================================
 # SHADOW FX BOT - ICT SIGNAL ENGINE
-# =================================
+# ==========================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL = "GC=F"  # Gold Futures market data
+SYMBOL = os.getenv("FOREX_SYMBOL", "GC=F")
+RR = 2
 
 
-def get_candles(interval, period):
+def get_data(interval, period):
     try:
-        data = yf.download(
+        df = yf.download(
             SYMBOL,
             interval=interval,
             period=period,
@@ -25,31 +26,26 @@ def get_candles(interval, period):
             threads=False
         )
 
-        if data is None or data.empty:
+        if df is None or df.empty:
             return None
 
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-        required = ["Open", "High", "Low", "Close"]
+        df = df[["Open", "High", "Low", "Close"]].dropna()
 
-        if not all(col in data.columns for col in required):
+        if len(df) < 60:
             return None
 
-        data = data[required].dropna()
+        return df
 
-        if len(data) < 25:
-            return None
-
-        return data
-
-    except Exception as error:
-        print(f"Data error ({interval}): {error}")
+    except Exception as e:
+        print(f"DATA ERROR {interval}: {e}")
         return None
 
 
-def market_bias(df):
-    if df is None or len(df) < 50:
+def get_bias(df):
+    if df is None or len(df) < 55:
         return None
 
     close = df["Close"]
@@ -68,40 +64,35 @@ def market_bias(df):
 
 
 def liquidity_sweep(df):
-    if df is None or len(df) < 22:
+    if df is None or len(df) < 25:
         return None
 
-    # Use closed candles only
-    for i in range(len(df) - 2, max(len(df) - 5, 20) - 1, -1):
-        previous = df.iloc[i - 20:i]
-        candle = df.iloc[i]
+    candle = df.iloc[-2]
+    previous = df.iloc[-22:-2]
 
-        old_low = float(previous["Low"].min())
-        old_high = float(previous["High"].max())
+    old_high = float(previous["High"].max())
+    old_low = float(previous["Low"].min())
 
-        if (
-            float(candle["Low"]) < old_low
-            and float(candle["Close"]) > old_low
-        ):
-            return "BUY", float(candle["Low"])
+    low = float(candle["Low"])
+    high = float(candle["High"])
+    close = float(candle["Close"])
 
-        if (
-            float(candle["High"]) > old_high
-            and float(candle["Close"]) < old_high
-        ):
-            return "SELL", float(candle["High"])
+    if low < old_low and close > old_low:
+        return "BUY", low
+
+    if high > old_high and close < old_high:
+        return "SELL", high
 
     return None
 
 
-def has_fvg(df, direction):
+def detect_fvg(df, direction):
     if df is None or len(df) < 5:
         return False
 
-    # Search recent closed candles
-    for i in range(max(2, len(df) - 7), len(df) - 1):
-        first = df.iloc[i - 2]
-        third = df.iloc[i]
+    for i in range(len(df) - 5, len(df) - 2):
+        first = df.iloc[i]
+        third = df.iloc[i + 2]
 
         if direction == "BUY":
             if float(third["Low"]) > float(first["High"]):
@@ -114,8 +105,53 @@ def has_fvg(df, direction):
     return False
 
 
+def detect_order_block(df, direction):
+    if df is None or len(df) < 10:
+        return False
+
+    candles = df.iloc[-10:-2]
+
+    for i in range(len(candles) - 1):
+        candle = candles.iloc[i]
+        next_candle = candles.iloc[i + 1]
+
+        body = abs(float(next_candle["Close"]) -
+                   float(next_candle["Open"]))
+
+        if direction == "BUY":
+            if (
+                float(candle["Close"]) < float(candle["Open"])
+                and float(next_candle["Close"]) > float(candle["High"])
+                and body > 0
+            ):
+                return True
+
+        if direction == "SELL":
+            if (
+                float(candle["Close"]) > float(candle["Open"])
+                and float(next_candle["Close"]) < float(candle["Low"])
+                and body > 0
+            ):
+                return True
+
+    return False
+
+
+def market_structure(df, direction):
+    if df is None or len(df) < 25:
+        return False
+
+    previous = df.iloc[-12:-2]
+    current = df.iloc[-2]
+
+    if direction == "BUY":
+        return float(current["Close"]) > float(previous["High"].max())
+
+    return float(current["Close"]) < float(previous["Low"].min())
+
+
 def confirmation(df, direction):
-    if df is None or len(df) < 3:
+    if df is None or len(df) < 5:
         return False
 
     previous = df.iloc[-3]
@@ -133,6 +169,20 @@ def confirmation(df, direction):
     )
 
 
+def calculate_rsi(df):
+    close = df["Close"]
+    change = close.diff()
+
+    gain = change.clip(lower=0)
+    loss = -change.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 0.000001)
+    return 100 - (100 / (1 + rs))
+
+
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
         raise ValueError("Telegram secrets are missing!")
@@ -141,118 +191,151 @@ def send_telegram(message):
 
     response = requests.post(
         url,
-        data={
-            "chat_id": CHAT_ID,
-            "text": message
-        },
+        data={"chat_id": CHAT_ID, "text": message},
         timeout=20
     )
 
     response.raise_for_status()
 
-    result = response.json()
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram message failed")
 
-    if not result.get("ok"):
-        raise RuntimeError("Telegram rejected the message")
-
-    print("Telegram signal sent successfully!")
+    print("TELEGRAM SIGNAL SENT!")
 
 
 def analyze():
-    print("Starting SHADOW FX BOT...")
-    print("Downloading market candles...")
+    print("================================")
+    print("SHADOW FX BOT STARTED")
+    print("================================")
 
-    daily = get_candles("1d", "6mo")
-    hourly = get_candles("1h", "30d")
-    fifteen = get_candles("15m", "60d")
-    five = get_candles("5m", "5d")
+    daily = get_data("1d", "6mo")
+    hourly = get_data("1h", "30d")
+    fifteen = get_data("15m", "60d")
+    five = get_data("5m", "5d")
 
     if any(x is None for x in [daily, hourly, fifteen, five]):
-        print("Market data unavailable. No signal.")
+        print("Market data unavailable. NO TRADE.")
         return
 
-    # Build H4 candles from H1
-    four_hour = hourly.resample("4h").agg({
+    # Build H4 candles from H1 data
+    h4 = hourly.resample("4h").agg({
         "Open": "first",
         "High": "max",
         "Low": "min",
         "Close": "last"
     }).dropna()
 
-    d1 = market_bias(daily)
-    h4 = market_bias(four_hour)
-    h1 = market_bias(hourly)
+    d1_bias = get_bias(daily)
+    h4_bias = get_bias(h4)
+    h1_bias = get_bias(hourly)
 
-    print("D1:", d1)
-    print("H4:", h4)
-    print("H1:", h1)
+    print("D1:", d1_bias)
+    print("H4:", h4_bias)
+    print("H1:", h1_bias)
 
-    if not all([d1, h4, h1]) or len({d1, h4, h1}) != 1:
-        print("Timeframes are not aligned. Waiting.")
+    # Higher timeframe direction
+    if not all([d1_bias, h4_bias, h1_bias]):
+        print("No clear trend. NO TRADE.")
         return
 
-    direction = d1
+    if len({d1_bias, h4_bias, h1_bias}) != 1:
+        print("Timeframes not aligned. NO TRADE.")
+        return
 
-    sweep = liquidity_sweep(fifteen)
+    direction = d1_bias
+
+    # H1 liquidity sweep
+    sweep = liquidity_sweep(hourly)
 
     if not sweep or sweep[0] != direction:
-        print("No matching liquidity sweep.")
+        print("No H1 liquidity sweep. NO TRADE.")
         return
 
-    if not has_fvg(fifteen, direction):
-        print("No matching 15M Fair Value Gap.")
+    # H1 Fair Value Gap or Order Block
+    fvg = detect_fvg(hourly, direction)
+    ob = detect_order_block(hourly, direction)
+
+    if not fvg and not ob:
+        print("No H1 FVG or Order Block. NO TRADE.")
         return
 
+    # M15 market structure confirmation
+    if not market_structure(fifteen, direction):
+        print("M15 BOS confirmation missing. NO TRADE.")
+        return
+
+    # M5 entry confirmation
     if not confirmation(five, direction):
-        print("Waiting for 5M confirmation.")
+        print("Waiting for M5 confirmation.")
+        return
+
+    # RSI filter
+    rsi = float(calculate_rsi(five).iloc[-2])
+
+    if direction == "BUY" and rsi > 75:
+        print("BUY rejected: RSI too high.")
+        return
+
+    if direction == "SELL" and rsi < 25:
+        print("SELL rejected: RSI too low.")
         return
 
     entry = float(five["Close"].iloc[-2])
-    extreme = sweep[1]
+    stop = float(sweep[1])
 
     if direction == "BUY":
-        sl = extreme
-        risk = entry - sl
-        tp = entry + (risk * 2)
-    else:
-        sl = extreme
-        risk = sl - entry
-        tp = entry - (risk * 2)
+        risk = entry - stop
+        if risk <= 0:
+            print("Invalid BUY stop loss.")
+            return
+        tp = entry + (risk * RR)
 
-    if risk <= 0:
-        print("Invalid Stop Loss. No signal.")
-        return
+    else:
+        risk = stop - entry
+        if risk <= 0:
+            print("Invalid SELL stop loss.")
+            return
+        tp = entry - (risk * RR)
+
+    setup = []
+    if fvg:
+        setup.append("FVG")
+    if ob:
+        setup.append("Order Block")
 
     message = f"""
 SHADOW FX BOT
-ICT SIGNAL
+ICT TRADE SIGNAL
 
-Instrument: GOLD FUTURES (GC=F)
-Direction: {direction}
+SYMBOL: {SYMBOL}
+DIRECTION: {direction}
 
 ENTRY: {entry:.2f}
-STOP LOSS: {sl:.2f}
+STOP LOSS: {stop:.2f}
 TAKE PROFIT: {tp:.2f}
 
-Risk Reward: 1:2
+RISK REWARD: 1:{RR}
 
-MARKET ANALYSIS
-D1: {d1}
-H4: {h4}
-H1: {h1}
+MULTI-TIMEFRAME ANALYSIS
+D1: {d1_bias}
+H4: {h4_bias}
+H1: {h1_bias}
 
-M15: Liquidity Sweep + FVG
-M5: Confirmation passed
-
-Data Source: Yahoo Finance
-Signal Type: ICT-style rule-based analysis
+ICT ANALYSIS
+Liquidity Sweep: PASSED
+M15 BOS: PASSED
+M5 Confirmation: PASSED
+Setup: {" + ".join(setup)}
+RSI: {rsi:.2f}
 
 Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 
+Data: Yahoo Finance
+Mode: Rule-based ICT analysis
+
 WARNING:
-This is Gold Futures data, not a guaranteed
-broker XAUUSD execution price.
-Verify the setup before trading.
+GC=F is Gold Futures, not broker XAUUSD.
+Verify prices before trading.
 """
 
     send_telegram(message)
